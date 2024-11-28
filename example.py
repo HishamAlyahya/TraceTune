@@ -1,23 +1,28 @@
-import dspy
+from chaintune import get_traced_sample
 
-from chaintune.reflection import ReflectionModule
-from chaintune.tracing import trace
+def llm(prompt):
+    return f"Hi its me llm {prompt}"
 
-from dotenv import load_dotenv
-
-if __name__ == "__main__":
-    load_dotenv()
-
-    lm = dspy.OpenAI(model="gpt-4o-mini", model_type="chat")
-    dspy.configure(lm=lm)
+def finetuned_llm(prompt):
+    return f"Hi its me FINETUNED {prompt}"
 
 
-    reflection = ReflectionModule()
+def traced_func(question):
+    c = 3
+    context = []
+    for i in range(c):
+        doc = llm(str(i))
+        context.append(doc)
+    return context
 
-    # Trace the function
-    traced_f = trace(reflection.forward, {"instruction": "What is the capital of France?"})
-
-    # Call the traced function
-    result = traced_f(instruction="What is the capital of France?")
-    print("Final result:", result)
-
+inp = {"question": "What?"}
+### Example usage
+print("Execution Mode (without finetuned model):")
+print("=========================================")
+sample = get_traced_sample(program=traced_func, program_inputs=inp)
+print(sample)
+print("=========================================")
+print("Inference Mode (with finetuned model):")
+print("=========================================")
+sample = get_traced_sample(program=traced_func, program_inputs=inp, finetuned_model=finetuned_llm)
+print(sample)
