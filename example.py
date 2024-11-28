@@ -3,9 +3,13 @@ import dspy
 from chaintune.reflection import ReflectionModule
 from chaintune.tracing import trace
 
+from dotenv import load_dotenv
+
 if __name__ == "__main__":
-    dspy.configure(lm=lm)
+    load_dotenv()
+
     lm = dspy.OpenAI(model="gpt-4o-mini", model_type="chat")
+    dspy.configure(lm=lm)
 
 
     reflection = ReflectionModule()
