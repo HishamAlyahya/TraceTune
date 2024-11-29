@@ -1,10 +1,10 @@
+#%%
 import pdb
+import random
 import sys
 import copy
 import linecache
 import dspy
-
-from random import random
 
 class ExecutionTracker(pdb.Pdb):
     def __init__(self, traced_program, program_inputs, finetuned_model=None, llm_fns=None, *args, **kwargs):
@@ -48,6 +48,14 @@ class ExecutionTracker(pdb.Pdb):
         # TODO: could be done more robustly by dealing with more reliable types rather than just string matching
         return any([fn in line for fn in self.llm_fns])
 
+
+    def get_llm_fn_signature_schema(self, llm_fn: str, local_dict):
+        llm_fn_module = getattr(local_dict["self"], llm_fn)
+        signature = llm_fn_module.extended_signature if hasattr(llm_fn_module, "extended_signature") else llm_fn_module.signature
+        signature_schema = signature.model_json_schema()
+        
+        return signature_schema
+
     
     def call_finetuned_model(self, line, current_local_dict):
         def get_llm_args_kwargs(inputs):
@@ -77,15 +85,55 @@ class ExecutionTracker(pdb.Pdb):
         args = ", ".join([repr(arg) for arg in args])
         kwargs = ", ".join([f"{k}={repr(v)}" for k,v in kwargs.items()])
         prompt = args + " " +  kwargs
-        llm_output =  self.finetuned_model(prompt)[0]
+        prompt = self.trace_string + line.strip()
+
+        for fn_name in self.llm_fns:
+            if fn_name in line:
+                llm_fn = fn_name
+
+        signature_schema = self.get_llm_fn_signature_schema(llm_fn=llm_fn, local_dict=current_local_dict)
+
+        # take only the output fields
+        inp_fields = {}
+        for field_name, props in signature_schema["properties"].items():
+            if props["__dspy_field_type"] == "output":
+                inp_fields[field_name] = props
+
+        variable_name = line.split("=")[0].strip()
+        prediction = {}
+        for inp_field, props in inp_fields.items():
+            prompt += f"> {variable_name}.{inp_field} = {props['prefix']} "
+            llm_output =  self.finetuned_model(prompt)[0]
+            prediction[inp_field] = llm_output
+            prompt += llm_output + "\n"
+        llm_output = dspy.Prediction(prediction)
         return llm_output
 
-    def diff_write(self, prev, current):
+    def diff_write(self, prev, current, line):
         diff = dict(set(current.items()) - set(prev.items()))   
         diff = sorted(diff.items())
             
         for k, v in diff:
             if k in self.program_inputs and self.program_inputs[k] == v:
+                continue
+
+            if k == "self":
+                continue    
+
+            # this bit of code makes sure that every prediction is printed in such a way that follows the steps the underlying module is doing to generate the output.
+            # for example, when using dspy.ChainOfThought, both the rationale and the answer is ensured to be printed in the correct order
+            # the "prefix" bit is what gets prefixed to the output of every dspy module. this key is always defined.
+            # for example, if the output field "answer" is there in the prediction, it will always not include the prefix
+            # this code ensure that instead of printing for example "the capital of France is Paris", it would print "Answer: the capital of France is Paris"
+            if isinstance(v, dspy.Prediction):
+                for inp, out in v.items():
+                    for llm_fn in self.llm_fns:
+                        if llm_fn in line:
+                            signature_schema = self.get_llm_fn_signature_schema(llm_fn=llm_fn, local_dict=current)
+                            prefix = signature_schema["properties"][inp]["prefix"]
+                            self.trace_string += f"> {k}.{inp} = {prefix} {out}\n"
+                            break
+                self.trace_string += "\n"
                 continue
 
             self.trace_string += f"> {k} = {v}\n\n"
@@ -109,6 +157,40 @@ class ExecutionTracker(pdb.Pdb):
             return 
         current_local_dict = frame.f_locals
     
+
+        for key, value in self.generated_variables.items():
+            if isinstance(value, dspy.Prediction):
+                frame.f_locals[key] = value
+            else:
+                exec(f"{key} = {repr(value)}", frame.f_globals, frame.f_locals)        
+
+        
+        # if we have reached the end of the trace, stop tracing
+        if cur_line.strip() == "set_trace(end=True)":
+            return
+
+        new_dict = {}
+        for k, v in current_local_dict.items():
+            if isinstance(v, dspy.Module):
+                new_dict[k] = v
+                continue
+
+            if isinstance(v, dspy.Prediction):
+                new_dict[k] = v
+                continue
+            try:
+                new_dict[k] = str(v)
+            except:
+                pass
+
+        current_local_dict = new_dict
+        
+        if self.prev_local_dict is None:
+            # this is the first call after setting our debugger 
+            self.first_write()
+        else:
+            self.diff_write(prev=self.prev_local_dict, current=current_local_dict, line=self.prev_line)
+
         ###### INFERENCE MODE ######
         # TODO: naive way to do it but it could be done very cleanly and robustly
         if self.finetuned_model and self.is_llm_call(cur_line):
@@ -121,36 +203,8 @@ class ExecutionTracker(pdb.Pdb):
                 v = self.call_finetuned_model(cur_line, current_local_dict)
                 self.generated_variables[k] = v
 
-        for key, value in self.generated_variables.items():
-            exec(f"{key} = {repr(value)}", frame.f_globals, frame.f_locals)        
 
-
-        
-        # if we have reached the end of the trace, stop tracing
-        if cur_line.strip() == "set_trace(end=True)":
-            return
-
-        new_dict = {}
-        for k, v in current_local_dict.items():
-            try:
-                new_dict[k] = str(v)
-            except:
-                pass
-
-        current_local_dict = new_dict
-        
-        if self.prev_local_dict is None:
-            # this is the first call after setting our debugger 
-            self.first_write()
-        else:
-
-            next_lineno = frame.f_lineno + 1
-
-            next_line = linecache.getline(filename, next_lineno).strip()
-
-            self.diff_write(prev=self.prev_local_dict, current=current_local_dict)
-        
-        self.prev_local_dict = copy.deepcopy(current_local_dict)
+        self.prev_local_dict = copy.copy(current_local_dict)
     
         self.prev_line = cur_line
 
@@ -184,15 +238,42 @@ def get_traced_sample(program: callable, program_inputs: dict, finetuned_model: 
 
 # %%
 # Useful for quick debugging, ok to remove. 
+class BasicMultiHop(dspy.Module):
+  def __init__(self, passages_per_hop=3):
+    self.retrieve = dspy.Retrieve(k=passages_per_hop)
+    self.generate_query = dspy.ChainOfThought("context, question -> search_query")
+    self.generate_answer = dspy.ChainOfThought("context, question -> answer")
 
+  def forward(self, question):
+    context = []
+
+    for hop in range(2):
+      query = self.generate_query(context=context, question=question)
+      context += self.retrieve(query.search_query).passages
+
+    # this was a single line: "return self.generate_answer(context=context, question=question)" 
+    # spliting to two lines to allow tracing to capture the intermediate value, however there is a fundamental problem here ..
+    # but works for now
+    answer = self.generate_answer(context=context, question=question) 
+    return answer
+  
+  
 # prog = BasicMultiHop()
 # lm = dspy.OpenAI(model="gpt-4o-mini", model_type="chat")
 # colbertv2 = dspy.ColBERTv2(url='http://20.102.90.50:2017/wiki17_abstracts')
 
 # dspy.settings.configure(rm=colbertv2, lm=lm)
-                           
+# import random
+def finetuned_llm(prompt):
+    random_queries = [
+        "Who is the king of Saudi Arabia?",
+        "How many people live in Spain?",
+        "What's the riemann hypothesis?",
+    ]
+    return [f"Last 3 words before this are: [{', '.join(prompt.split()[-3:])}]. now, {random.choice(random_queries)}"]
 # inp = {"question": "What is the capital of France??"}
-# sample = get_traced_sample(prog.forward, inp, finetuned_model=lm)
+# sample = get_traced_sample(prog.forward, inp )
+# print(sample)
 # # %%
 # lm("hi")
 # # %%
@@ -296,3 +377,5 @@ def get_traced_sample(program: callable, program_inputs: dict, finetuned_model: 
 # args = ", ".join([repr(arg) for arg in llm_args])
 # kwargs = ", ".join([f"{k}={repr(v)}" for k,v in llm_kwargs.items()])
 # print(args + " " +  kwargs)
+
+# %%
