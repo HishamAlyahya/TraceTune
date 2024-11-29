@@ -238,24 +238,24 @@ def get_traced_sample(program: callable, program_inputs: dict, finetuned_model: 
 
 # %%
 # Useful for quick debugging, ok to remove. 
-class BasicMultiHop(dspy.Module):
-  def __init__(self, passages_per_hop=3):
-    self.retrieve = dspy.Retrieve(k=passages_per_hop)
-    self.generate_query = dspy.ChainOfThought("context, question -> search_query")
-    self.generate_answer = dspy.ChainOfThought("context, question -> answer")
+# class BasicMultiHop(dspy.Module):
+#   def __init__(self, passages_per_hop=3):
+#     self.retrieve = dspy.Retrieve(k=passages_per_hop)
+#     self.generate_query = dspy.ChainOfThought("context, question -> search_query")
+#     self.generate_answer = dspy.ChainOfThought("context, question -> answer")
 
-  def forward(self, question):
-    context = []
+#   def forward(self, question):
+#     context = []
 
-    for hop in range(2):
-      query = self.generate_query(context=context, question=question)
-      context += self.retrieve(query.search_query).passages
+#     for hop in range(2):
+#       query = self.generate_query(context=context, question=question)
+#       context += self.retrieve(query.search_query).passages
 
-    # this was a single line: "return self.generate_answer(context=context, question=question)" 
-    # spliting to two lines to allow tracing to capture the intermediate value, however there is a fundamental problem here ..
-    # but works for now
-    answer = self.generate_answer(context=context, question=question) 
-    return answer
+#     # this was a single line: "return self.generate_answer(context=context, question=question)" 
+#     # spliting to two lines to allow tracing to capture the intermediate value, however there is a fundamental problem here ..
+#     # but works for now
+#     answer = self.generate_answer(context=context, question=question) 
+#     return answer
   
   
 # prog = BasicMultiHop()
@@ -264,13 +264,13 @@ class BasicMultiHop(dspy.Module):
 
 # dspy.settings.configure(rm=colbertv2, lm=lm)
 # import random
-def finetuned_llm(prompt):
-    random_queries = [
-        "Who is the king of Saudi Arabia?",
-        "How many people live in Spain?",
-        "What's the riemann hypothesis?",
-    ]
-    return [f"Last 3 words before this are: [{', '.join(prompt.split()[-3:])}]. now, {random.choice(random_queries)}"]
+# def finetuned_llm(prompt):
+#     random_queries = [
+#         "Who is the king of Saudi Arabia?",
+#         "How many people live in Spain?",
+#         "What's the riemann hypothesis?",
+#     ]
+#     return [f"Last 3 words before this are: [{', '.join(prompt.split()[-3:])}]. now, {random.choice(random_queries)}"]
 # inp = {"question": "What is the capital of France??"}
 # sample = get_traced_sample(prog.forward, inp )
 # print(sample)
