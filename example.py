@@ -28,7 +28,6 @@ def call_openai_api(prompt, model="gpt-4o", temperature=0.7):
     data = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "You are an AI assistant that generates search queries and answers questions."},
             {"role": "user", "content": prompt}
         ],
         "temperature": temperature
