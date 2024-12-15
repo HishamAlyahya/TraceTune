@@ -18,7 +18,7 @@ def retrieve(query: str, k: int = 2):
     topk = [{**d, "long_text": d["text"]} for d in topk]
     return topk[:k]
 
-def call_openai_api(prompt, model="gpt-4", temperature=0.7):
+def call_openai_api(prompt, model="gpt-4o", temperature=0.7):
     """Calls the OpenAI API with a given prompt and returns the response."""
     headers = {
         "Content-Type": "application/json",
