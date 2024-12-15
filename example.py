@@ -1,7 +1,7 @@
 import requests
 import os
 
-import chaintune as tt
+import tracetune as tt
 
 from dotenv import load_dotenv
 load_dotenv()
