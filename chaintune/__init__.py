@@ -1,1 +1,1 @@
-from chaintune.tracing import ExecutionTracker, get_traced_sample
+from chaintune.tracing import trace
