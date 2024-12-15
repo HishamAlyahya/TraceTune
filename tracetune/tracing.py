@@ -91,7 +91,7 @@ class ExecutionTracker(pdb.Pdb):
                     break
                 continue
 
-            if llm_fn in line:
+            if self.llm_fns and llm_fn in line:
                 break
 
             self.trace_string += f"> {k} = {v}\n\n"
