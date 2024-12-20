@@ -3,19 +3,19 @@ import os
 
 import tracetune as tt
 
-from dotenv import load_dotenv
-load_dotenv()
+# from dotenv import load_dotenv
+# load_dotenv()
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 # use ColBERTv2 retrieval model that's publically hosted
-def retrieve(query: str, k: int = 2):
+def retrieve(query: str, k: int = 1):
     payload = {"query": query, "k": k}
     res = requests.get("http://20.102.90.50:2017/wiki17_abstracts", params=payload, timeout=10)
 
     topk = res.json()["topk"][:k]
-    topk = [{**d, "long_text": d["text"]} for d in topk]
+    topk = [d["text"] for d in topk]
     return topk[:k]
 
 def call_openai_api(prompt, model="gpt-4o", temperature=0.7):
@@ -38,16 +38,27 @@ def call_openai_api(prompt, model="gpt-4o", temperature=0.7):
     return response.json()["choices"][0]["message"]["content"]
 
 
-def generate_query(context, question):
+
+def generate_search_term_thought(question, context=[]):
     prompt = (
         "You will take as input a context and a question. "
-        "Your task is to generate a search query that would help find relevant information."
+        "Your task is to generate reasoning that will guide you to choose the most suitable next search term that would help find relevant information."
         f"Context:\n{context}\n\nQuestion: {question}"
-        "Now generate a search query that would help find relevant information."
+        "Now generate the reasoning."
     )
     return call_openai_api(prompt)
 
-def generate_answer(context, question):
+def generate_search_term(question, reasoning, context=[]):
+    prompt = (
+        "You will take as input a context and a question. "
+        "Your task is to generate a search term that would help find relevant information."
+        f"Context:\n{context}\n\nQuestion: {question}"
+        f"The following is reasoning to guide you towards choosing a good next search term:\n\n{reasoning}"
+        "Now generate a search term that would help find relevant information."
+    )
+    return call_openai_api(prompt)
+
+def generate_answer(question, context):
     prompt = (
         "You will take as input a context and a question. "
         "Your task is to generate an accurate and concise answer."
@@ -57,15 +68,17 @@ def generate_answer(context, question):
     return call_openai_api(prompt)
 
 
-@tt.trace(llm_fns=["generate_query", "generate_answer"])
-def multi_hop(question, hops=2):
+@tt.trace(llm_fns=["generate_search_term_thought", "generate_search_term", "generate_answer"])
+def multi_hop(question, hops=3):
     context = []
 
     for hop in range(hops):
-        query = generate_query(context=context, question=question)
-        context += retrieve(query=query)
+        thought = generate_search_term_thought(question, context)
+        search_term = generate_search_term(question, context, thought)
+        context += retrieve(search_term)
 
-    answer = generate_answer(context=context, question=question)
+    answer = generate_answer(question, context)
+    
     return answer
 
 traced_multi_hop = multi_hop("How many storeys are in the castle that David Gregory inherited?")
