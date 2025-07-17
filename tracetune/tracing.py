@@ -117,6 +117,7 @@ class ExecutionTracker(pdb.Pdb):
         if self.first and event == "call":
             self.set_step()
             self.first = False
+            self.steps += 1
             return super().trace_dispatch(frame, event, arg)
 
         # only trace lines
@@ -130,6 +131,12 @@ class ExecutionTracker(pdb.Pdb):
         # if we have reached the end of the trace, stop tracing
         if cur_line.strip() == "set_trace(end=True)":
             return
+        
+        # first, restore the original functions of previous steps
+        for fn in self._mocked_functions:
+            if fn in frame.f_globals:   
+                frame.f_globals[fn] = self._mocked_functions[fn]
+        self._mocked_functions = {}
 
         current_local_dict = convert_to_hashable_dict(frame.f_locals)
         if self.steps == self.initial_step_count + 1:
@@ -140,7 +147,10 @@ class ExecutionTracker(pdb.Pdb):
             )
 
             self.frame_history.append(Frame(frame))
-            self.trace_string += f"Step {self.steps}: {linecache.getline(frame.f_code.co_filename, frame.f_lineno, frame.f_globals).strip()}\n>"
+            self.trace_string += f"Step {self.steps - 1}: {linecache.getline(frame.f_code.co_filename, frame.f_lineno, frame.f_globals).strip()}\n>"
+            if self.is_llm_call(cur_line):
+                var_name = cur_line.split("=")[0].strip()
+                self.trace_string += f" {var_name} = {self.start_token} "
             raise PauseExecutionException(is_llm_call=self.is_llm_call(cur_line))
 
 
@@ -157,12 +167,6 @@ class ExecutionTracker(pdb.Pdb):
 
         # if we are continuing the trace, we need to mock the functions that are being called
         if self.steps <= self.initial_step_count and self.steps > 1:
-            # first, restore the original functions of previous steps
-            for fn in self._mocked_functions:
-                if fn in frame.f_globals:   
-                    frame.f_globals[fn] = self._mocked_functions[fn]
-            self._mocked_functions = {}
-
             # then, mock the functions that are being called
 
             error_parsing = False
@@ -202,9 +206,7 @@ class ExecutionTracker(pdb.Pdb):
                                 frame.f_globals[ast_node.value.func.id] = lambda *args, **kwargs: v
 
                     elif self.steps == self.initial_step_count and self.step_value is not None:
-                        print("STEP VALUE", self.step_value)
                         frame.f_globals[ast_node.value.func.id] = lambda *args, **kwargs: self.step_value
-
 
         self.prev_local_dict = copy.copy(current_local_dict)
         self.prev_line = cur_line
@@ -213,7 +215,7 @@ class ExecutionTracker(pdb.Pdb):
         if self.first and event == "line":
             return
 
-        self.trace_string += f"Step {self.steps}: " + cur_line.strip() + "\n"
+        self.trace_string += f"Step {self.steps - 1}: " + cur_line.strip() + "\n"
         self.steps += 1
 
 
@@ -230,19 +232,42 @@ class Frame:
         self.filename = frame.f_code.co_filename
         self.function = frame.f_code.co_name
         self.lineno = frame.f_lineno
-        self.globals = convert_to_hashable_dict(frame.f_globals)
-        self.locals = convert_to_hashable_dict(frame.f_locals)
+        self.globals = {}
+        for key, value in frame.f_globals.items():
+            try:
+                self.globals[key] = copy.deepcopy(value)
+            except:
+                self.globals[key] = str(value)
+
+        self.locals = {}
+        for key, value in frame.f_locals.items():
+            try:
+                self.locals[key] = copy.deepcopy(value)
+            except:
+                self.locals[key] = str(value)
 
 class TracedProgramState:
-    def __init__(self, func, llm_fns, ignored_vars, step_count=1, frame_history=None, inputs: dict = None, output=None) -> None:
+    def __init__(self, func, llm_fns, ignored_vars=None, start_token="[LLM]", end_token="[/LLM]", step_count=1, frame_history=None, inputs: dict = None, output=None) -> None:
         self.func = func
         self.llm_fns = llm_fns
-        self.ignored_vars = ignored_vars
+        self.ignored_vars = ignored_vars if ignored_vars else []
         self.step_count = step_count
         self.frame_history: list[Frame] = frame_history if frame_history else []
         self.inputs = inputs if inputs else {}
         self.output = output
         self.is_llm_call = False
+        self.start_token = start_token
+        self.end_token = end_token
+        self.execution_tracker = ExecutionTracker(
+            program_inputs=self.inputs,
+            traced_program=self.func,
+            llm_fns=self.llm_fns,
+            ignored_vars=self.ignored_vars,
+            frame_history=self.frame_history,
+            initial_step_count=self.step_count,
+            start_token=self.start_token,
+            end_token=self.end_token,
+        )
 
     def step(self, step_value=None):
         self.execution_tracker = ExecutionTracker(
@@ -252,7 +277,9 @@ class TracedProgramState:
             ignored_vars=self.ignored_vars,
             frame_history=self.frame_history,
             initial_step_count=self.step_count,
-            step_value=step_value
+            step_value=step_value,
+            start_token=self.start_token,
+            end_token=self.end_token,
         )
         def set_trace(end=False):
             if end:
@@ -282,6 +309,10 @@ class TracedProgramState:
     @property
     def is_done(self):
         return self.output is not None
+    
+    @property
+    def trace_string(self):
+        return self.execution_tracker.trace_string
 
 
 def trace(llm_fns=None, ignored_vars=None):
