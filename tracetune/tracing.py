@@ -1,7 +1,7 @@
 import ast
 import inspect
+import os
 import pdb
-import random
 import sys
 import copy
 import linecache
@@ -9,6 +9,7 @@ from inspect import signature
 from dataclasses import dataclass
 import types
 from typing import Any
+import cloudpickle
 
 class PauseExecutionException(Exception):
     def __init__(self, is_llm_call=False):
@@ -40,6 +41,7 @@ class ExecutionTracker(pdb.Pdb):
         *args,
         **kwargs,
     ):
+        # super(ExecutionTracker, self).__init__(*args, stdout=open(os.devnull, 'w'), **kwargs)
         super(ExecutionTracker, self).__init__(*args, **kwargs)
         self.traced_program = traced_program
         self.program_inputs = program_inputs
@@ -78,6 +80,14 @@ class ExecutionTracker(pdb.Pdb):
             if k in self.ignored_vars:
                 continue
             self.trace_string += f"{k} = {v}\n"
+        
+        # handle default values in the function signature
+        for k, v in inspect.signature(self.traced_program).parameters.items():
+            if k in self.ignored_vars:
+                continue
+            if k not in self.program_inputs:
+                self.trace_string += f"{k} = {v.default}\n"
+
         self.trace_string += f"\nExecution:\n\n"
 
     def is_llm_call(self, line):
@@ -87,8 +97,29 @@ class ExecutionTracker(pdb.Pdb):
     def diff_write(self, prev, current, line):
         diff = dict(set(current.items()) - set(prev.items()))
         diff = sorted(diff.items())
+
+        # if there are no changes, only write the output if the current line is an assignment.
+        # this makes it so that re-assignments of variables with the same value are rewritten.
         if not diff and self.steps > 1:
-            self.trace_string += f"> [No change in any variables]\n\n"
+            # check if the line is an assignment
+            try:
+                tree = ast.parse(line.strip(), mode='exec')
+            except:
+                self.trace_string += f"> [No change in any variables]\n\n"
+                return
+
+            if isinstance(tree.body[0], ast.Assign):
+                k = tree.body[0].targets[0].id
+                v = current[k]
+                if k in self.ignored_vars:
+                    return
+                if k in self.program_inputs and self.program_inputs[k] == v:
+                    return
+
+                self.trace_string += f"> {k} = {v}\n\n"
+            else:
+                self.trace_string += f"> [No change in any variables]\n\n"
+
         for k, v in diff:
             if k in self.ignored_vars:
                 continue
@@ -106,6 +137,24 @@ class ExecutionTracker(pdb.Pdb):
 
             if self.llm_fns and llm_fn in line:
                 break
+
+            try:
+                v = ast.literal_eval(v)
+                try:
+                    prev_v = ast.literal_eval(prev[k])
+                    assert isinstance(prev_v, list)
+                except:
+                    prev_v = []
+                if isinstance(v, list) and len(v) > 0:
+                    for i, item in enumerate(v):
+                        if isinstance(prev_v, list) and len(prev_v) > i and prev_v[i] == item:
+                            continue
+                        else:
+                            self.trace_string += f"> {k}[{i}] = {v[i]}\n"
+                    self.trace_string += "\n"
+                    break
+            except Exception as e:
+                pass
 
             self.trace_string += f"> {k} = {v}\n\n"
 
@@ -235,13 +284,15 @@ class Frame:
         self.globals = {}
         for key, value in frame.f_globals.items():
             try:
+                cloudpickle.dumps(value)
                 self.globals[key] = copy.deepcopy(value)
-            except:
+            except :
                 self.globals[key] = str(value)
 
         self.locals = {}
         for key, value in frame.f_locals.items():
             try:
+                cloudpickle.dumps(value)
                 self.locals[key] = copy.deepcopy(value)
             except:
                 self.locals[key] = str(value)
@@ -258,19 +309,11 @@ class TracedProgramState:
         self.is_llm_call = False
         self.start_token = start_token
         self.end_token = end_token
-        self.execution_tracker = ExecutionTracker(
-            program_inputs=self.inputs,
-            traced_program=self.func,
-            llm_fns=self.llm_fns,
-            ignored_vars=self.ignored_vars,
-            frame_history=self.frame_history,
-            initial_step_count=self.step_count,
-            start_token=self.start_token,
-            end_token=self.end_token,
-        )
+        self.trace_string = ""
 
     def step(self, step_value=None):
-        self.execution_tracker = ExecutionTracker(
+        # Create a new execution tracker for each step
+        execution_tracker = ExecutionTracker(
             program_inputs=self.inputs,
             traced_program=self.func,
             llm_fns=self.llm_fns,
@@ -281,15 +324,16 @@ class TracedProgramState:
             start_token=self.start_token,
             end_token=self.end_token,
         )
+
         def set_trace(end=False):
             if end:
-                self.execution_tracker.tracing_enabled = False
-                self.execution_tracker.trace_file = None
+                execution_tracker.tracing_enabled = False
+                execution_tracker.trace_file = None
                 return
 
-            self.execution_tracker.rcLines.append("next")
-            self.execution_tracker.set_trace(sys._getframe().f_back)
-            self.execution_tracker.tracing_enabled = True
+            execution_tracker.rcLines.append("next")
+            execution_tracker.set_trace(sys._getframe().f_back)
+            execution_tracker.tracing_enabled = True
         output = None
         try:
             set_trace()  # Start the debugger here
@@ -304,15 +348,12 @@ class TracedProgramState:
         # except Exception as e:
         #     print(f"Error setting trace: {e}")
         self.step_count += 1
+        self.trace_string = execution_tracker.trace_string
         return self
     
     @property
     def is_done(self):
         return self.output is not None
-    
-    @property
-    def trace_string(self):
-        return self.execution_tracker.trace_string
 
 
 def trace(llm_fns=None, ignored_vars=None):

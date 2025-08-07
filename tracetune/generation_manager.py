@@ -1,3 +1,4 @@
+import inspect
 import torch
 from typing import Callable, List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
@@ -5,6 +6,26 @@ from tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
 from tracing import TracedProgramState
 import concurrent.futures
+
+def _process_single_rollout(response: str, program_state: TracedProgramState, prev_trace_string: str, initial_prompt: str) -> Tuple[TracedProgramState, bool, str]:
+        """Process a single rollout by stepping the program state until it is at an LLM call or done."""
+        while not program_state.is_llm_call and not program_state.is_done:
+            program_state.step()
+        
+        is_active = not program_state.is_done
+        start = len(prev_trace_string) + len(response) - len(initial_prompt)
+        new_trace_string = program_state.trace_string[start:]
+        return program_state, is_active, new_trace_string
+
+def _step_program_state_with_value(response: str, program_state: TracedProgramState) -> TracedProgramState:
+        program_state.step(response.split(program_state.end_token)[0].strip())
+        return program_state
+
+def _step_program_state(program_state) -> TracedProgramState:
+        """Helper function to step a program state - must be at module level for pickling."""
+        program_state.step()
+        return program_state
+
 
 @dataclass
 class GenerationConfig:
@@ -18,6 +39,18 @@ class GenerationConfig:
     search_url: str = None
     topk: int = 3
     max_program_workers: int = 8
+
+
+@dataclass
+class TraceTuneGenerationConfig:
+    source_code_path: str
+    function_name: str
+    function_args: Dict[str, Any]
+    llm_input_key: str
+    llm_fns: List[str]
+    start_token: str = "[LLM]"
+    end_token: str = "[/LLM]"
+    ignored_vars: List[str] = None
 
 class TraceTuneGenerationManager:
     def __init__(
@@ -81,7 +114,7 @@ class TraceTuneGenerationManager:
         responses_str = [
             resp.split(self.end_token)[0] + self.end_token 
             if self.end_token in resp 
-            else resp 
+            else resp + self.end_token
             for resp in responses_str
         ]
 
@@ -94,21 +127,6 @@ class TraceTuneGenerationManager:
         responses = self._batch_tokenize(responses_str)
         return responses, responses_str
 
-    def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
-        """Process next observations from environment."""
-        
-        next_obs_ids = self.tokenizer(
-            next_obs, 
-            padding='longest',
-            return_tensors='pt',
-            add_special_tokens=False,  # Prevents adding special tokens
-        )['input_ids']
-
-        if next_obs_ids.shape[1] > self.config.max_obs_length:
-            print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
-            next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
-
-        return next_obs_ids
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor) -> Dict:
         """Update rolling state with new responses and observations."""
@@ -211,59 +229,122 @@ class TraceTuneGenerationManager:
 
         return padded_tensor, padded_tensor_with_info
 
-    def _rollout_programs(self, program_states: List[TracedProgramState],  prev_trace_strings: List[str], responses_str: Optional[List[str]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def _rollout_programs(self, program_states: List[TracedProgramState], prev_trace_strings: List[str], responses_str: Optional[List[str]] = None) -> Tuple[List[TracedProgramState], torch.Tensor, torch.Tensor]:
         """
         Rollout programs until they are at an LLM call or done. Returns new trace ids and active mask.
+
+        Args:
+            program_states: List[TracedProgramState]
+                The program states to rollout.
+            prev_trace_strings: List[str]
+                The previous trace strings.
+            responses_str: Optional[List[str]]
+                The LLM response string batch (if None, it means we are at the first step)
         """
         if responses_str is None:
             responses_str = ['' for _ in range(len(program_states))]
-
-        def process_single_rollout(response: str, program_state: TracedProgramState, prev_trace_string: str) -> Tuple[bool, str]:
-            while not program_state.is_llm_call and not program_state.is_done:
-                program_state.step()
             
-            is_active = not program_state.is_done
-            start = len(prev_trace_string) + len(response)
-            new_trace_string = program_state.trace_string[start:]
-            return is_active, new_trace_string
-            
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_program_workers) as executor:
-            future_to_index = {
-                executor.submit(process_single_rollout, response, program_state, prev_trace_string): i
-                for i, (response, program_state, prev_trace_string) in enumerate(zip(responses_str, program_states, prev_trace_strings))
-            }
-            
-            new_active_mask = [True] * len(program_states)
-            new_trace_strings = [''] * len(program_states)
-            
-            for future in concurrent.futures.as_completed(future_to_index):
-                index = future_to_index[future]
-                is_active, trace_string = future.result()
-                new_active_mask[index] = is_active
-                new_trace_strings[index] = trace_string
+        inputs = zip(responses_str, program_states, prev_trace_strings, [self.initial_prompt for _ in range(len(program_states))])
 
-        new_trace_ids = self._batch_tokenize(new_trace_strings)
-        active_mask = torch.tensor(new_active_mask, dtype=torch.bool)
+        new_trace_strings = [''] * len(program_states)
+        new_active_mask = [True] * len(program_states)
+        new_program_states = [None] * len(program_states)
 
-        return new_trace_ids, active_mask
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.config.max_program_workers) as executor:
+            futures = {executor.submit(_process_single_rollout, *args): idx for idx, args in enumerate(inputs)}
+            for future in concurrent.futures.as_completed(futures):
+                idx = futures[future]
+                program_state, is_active, trace_string = future.result()
+                new_active_mask[idx] = is_active
+                new_trace_strings[idx] = trace_string
+                new_program_states[idx] = program_state
 
+        return new_program_states, self._batch_tokenize(new_trace_strings), torch.tensor(new_active_mask, dtype=torch.bool)
+    
+    
     def _step_programs(self, program_states: List[TracedProgramState], responses_str: List[str]) -> List[TracedProgramState]:
         """Step programs until they are at an LLM call or done. Returns new program states."""
-        def process_single_step(response: str, program_state: TracedProgramState) -> None:
-            if program_state.end_token in response:
-                program_state.step(response.split(program_state.end_token)[0].strip())
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_program_workers) as executor:
-            future_to_index = {
-                executor.submit(process_single_step, response, program_state): i
-                for i, (response, program_state) in enumerate(zip(responses_str, program_states))
-            }
+        inputs = zip(responses_str, program_states)
+
+        new_program_states = [None] * len(program_states)
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.config.max_program_workers) as executor:
+            futures = {executor.submit(_step_program_state_with_value, *args): idx for idx, args in enumerate(inputs)}
+            for future in concurrent.futures.as_completed(futures):
+                program_state = future.result()
+                new_program_states[futures[future]] = program_state
+
+        return new_program_states
+
+    def _initialize_program_states(self, detokenized_inputs: List[str]) -> List[TracedProgramState]:
+        program_states: List[TracedProgramState] = [
+            TracedProgramState(func=self.program, ignored_vars=self.ignored_vars, llm_fns=self.llm_fns, inputs={**self.program_args, self.llm_input_key: input})
+            for input in detokenized_inputs
+        ]
+        new_program_states = [None] * len(program_states)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.config.max_program_workers) as executor:
+            futures = {executor.submit(_step_program_state, program_state): idx for idx, program_state in enumerate(program_states)}
+            for future in concurrent.futures.as_completed(futures):
+                new_program_states[futures[future]] = future.result()
             
-            # Wait for all futures to complete
-            for future in concurrent.futures.as_completed(future_to_index):
-                future.result()  # This will raise any exceptions that occurred
+        return new_program_states
 
+    @property
+    def initial_prompt(self):
+        prompt = f"""\
+Your task is to follow the execution of the following function, step by step:
 
+{inspect.getsource(self.program)}
+
+Any updated variables will be outputted in the following format after the execution of each step:
+> <variable_name> = <variable_value>
+
+There are some functions whose outputs are your job to fill in. The values of these function are wrapped in {self.start_token} and {self.end_token} tags. For example:
+> <variable_name> = {self.start_token} [YOUR OUTPUT HERE] {self.end_token}
+
+These functions are:
+{self.llm_fns}
+
+Here is an example of the first few steps of the execution of this function on an example input:
+Inputs:
+question = What is the capital of France?
+hops = 3
+topk = 3
+
+Execution:
+
+Step 1: context = []
+> context = []
+
+Step 2: for hop in range(hops):
+> hop = 0
+
+Step 3: thought = generate_search_term_thought(question, context)
+> thought = {self.start_token} [YOUR THOUGHT HERE] {self.end_token}
+
+Step 4: search_term = generate_search_term(question, context, thought)
+> search_term = {self.start_token} [YOUR SEARCH TERM HERE] {self.end_token}
+
+Step 5: context += retrieve(search_term)
+> context[0] = [RETRIEVED PASSAGE 1]
+> context[1] = [RETRIEVED PASSAGE 2]
+> context[2] = [RETRIEVED PASSAGE 3]
+
+Step 6: for hop in range(hops):
+> hop = 1
+...
+
+Step N: answer = generate_answer(question, context)
+> answer = {self.start_token} [YOUR ANSWER HERE] {self.end_token}
+
+---
+
+Now, you will be given a new input followed by the execution trace of the function.
+
+"""
+        return prompt
     def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""
 
@@ -271,16 +352,9 @@ class TraceTuneGenerationManager:
 
         # initialize program states for each input in the batch
         detokenized_inputs = self.tokenizer.batch_decode(initial_input_ids, skip_special_tokens=True)
-        program_states: List[TracedProgramState] = [
-            TracedProgramState(func=self.program, ignored_vars=self.ignored_vars, llm_fns=self.llm_fns, inputs={**self.program_args, self.llm_input_key: input})
-            for input in detokenized_inputs
-        ]
+        program_states = self._initialize_program_states(detokenized_inputs)
 
-        for program_state in program_states:
-            program_state.step()
-
-        initial_trace_strings = [program_state.trace_string for program_state in program_states]
-
+        initial_trace_strings = [self.initial_prompt + program_state.trace_string for program_state in program_states]
 
         rollings = gen_batch
         
@@ -288,10 +362,11 @@ class TraceTuneGenerationManager:
         rollings.batch['attention_mask'] = self.tensor_fn.create_attention_mask(rollings.batch['input_ids'])
         rollings.batch['position_ids'] = self.tensor_fn.create_position_ids(rollings.batch['attention_mask'])
 
-
-        new_trace_ids, active_mask = self._rollout_programs(program_states=program_states, prev_trace_strings=initial_trace_strings)
+        program_states, new_trace_ids, active_mask = self._rollout_programs(program_states=program_states, prev_trace_strings=initial_trace_strings)
 
         rollings = self._update_rolling_state(rollings=rollings, cur_responses=new_trace_ids)
+
+        program_states = self._initialize_program_states(detokenized_inputs)
 
         output_ids = rollings.batch['input_ids'][:, -self.config.max_start_length:]
 
@@ -300,7 +375,6 @@ class TraceTuneGenerationManager:
 
         # Main generation loop
         for step in range(self.config.max_turns):
-
             if not active_mask.sum():
                 break
 
@@ -309,7 +383,6 @@ class TraceTuneGenerationManager:
                 keys=['input_ids', 'attention_mask', 'position_ids']
             )
             
-            # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
             rollings_active = DataProto.from_dict({
                 k: v[active_mask] for k, v in rollings.batch.items()
             })            
@@ -330,11 +403,11 @@ class TraceTuneGenerationManager:
             )
 
             ##### TT STEP #####
-            prev_trace_strings = [program_state.trace_string for program_state in program_states]
-            self._step_programs(program_states=program_states, responses_str=responses_str)
+            prev_trace_strings = [self.initial_prompt + program_state.trace_string for program_state in program_states]
+            program_states = self._step_programs(program_states=program_states, responses_str=responses_str)
 
             ##### TT ROLLOUT #####
-            new_trace_ids, active_mask = self._rollout_programs(program_states=program_states, prev_trace_strings=prev_trace_strings, responses_str=responses_str)
+            program_states, new_trace_ids, active_mask = self._rollout_programs(program_states=program_states, prev_trace_strings=prev_trace_strings, responses_str=responses_str)
 
             ##### TT UPDATE ROLLING STATE WITH NEW TRACE #####
             rollings = self._update_rolling_state(rollings=rollings, cur_responses=new_trace_ids)
